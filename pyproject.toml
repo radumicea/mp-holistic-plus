@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mp-holistic-plus"
+version = "1.0.0"
+description = "Pose, face and hand landmarks of one person per video with MediaPipe's models, batched on an NVIDIA GPU"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.11.0",                   # the CUDA 13 build: --extra-index-url https://download.pytorch.org/whl/cu130
+    "tensorrt-cu13==10.15.1.29",
+    "onnx==1.23.1",
+    "mediapipe==1.0.1",
+    "ai-edge-litert==2.2.0",
+    "opencv-contrib-python==5.0.0.93", # the crops are made with OpenCV: other builds round them differently
+    "numpy==2.2.6",
+]
+
+[tool.setuptools]
+packages = ["mp_holistic_plus"]
+
+[tool.setuptools.package-data]
+mp_holistic_plus = ["assets/*.npz"]
