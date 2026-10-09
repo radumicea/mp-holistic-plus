@@ -123,14 +123,14 @@ person's.
 | array | shape, type | |
 |---|---|---|
 | `pose_xyz` | (T, 33, 3) float16 | MediaPipe's 33 pose points |
-| `pose_vis`, `pose_pres` | (T, 33) uint8 | visibility and presence, 0 to 255 |
+| `pose_vis`, `pose_pres` | (T, 33) uint8 | each point's visibility and presence, 0 to 255 |
 | `pose_world` | (T, 33, 3) float16 | in metres, centred between the hips |
-| `pose_ok` | (T,) bool | pose found |
+| `pose_ok` | (T,) bool | pose found: the pose model's presence score for the whole pose is above `min_pose_presence_confidence` (0.5); that score is not stored |
 | `face_xyz` | (T, 478, 3) float16 | face mesh with irises |
 | `face_ok` | (T,) bool | face found |
 | `hand_xyz` | (T, 2, 21, 3) float16 | index 0 is the left hand, 1 the right |
 | `hand_world` | (T, 2, 21, 3) float16 | in metres, wrist placed on the pose's world wrist |
-| `hand_score` | (T, 2) uint8 | hand presence, 0 to 255; 0 where no hand was found |
+| `hand_score` | (T, 2) uint8 | the hand model's presence score for the whole hand, 0 to 255; 0 where no hand was found |
 | `hand_ok` | (T, 2) bool | hand found |
 | `hand_roi` | (T, 2, 4) float32 | the hand's box: centre x, y, side (relative to the longer image side), rotation in degrees |
 
