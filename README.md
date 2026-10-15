@@ -1,9 +1,9 @@
 # mp_holistic_plus
 
 Pose, face and hand landmarks of one person per video, made with MediaPipe's own
-models. It runs on an NVIDIA GPU and processes many videos at once. It was built
-for sign language and is the extractor of the RSL-News landmarks. Nothing in it is
-specific to sign language: it suits any video of one person whose hands matter.
+models. It runs on an NVIDIA GPU and processes many videos at once. It is made for
+videos of one person whose hands matter: hands that move fast, blur, and touch each
+other or the face.
 
 ## Why
 
@@ -11,13 +11,19 @@ MediaPipe Holistic tracks each hand from frame to frame. When it loses a hand, i
 waits for its palm detector to find the hand again. Fast hands, motion blur, and
 hands held against the face or against each other make it lose hands for many
 frames in a row. Sometimes it also puts the same hand in both the left and the right
-slot. Sign language does all of this all the time.
+slot. Fast, constant hand movement does all of this all the time.
 
 This library finds each hand from the pose instead, in every frame:
 
 1. A small network predicts the hand's box from the arm's pose points
    ([mediapipe-hand-crop-fix](https://github.com/sign-language-processing/mediapipe-hand-crop-fix)).
-   MediaPipe's hand landmark model runs on that box.
+   MediaPipe's hand landmark model runs on that box. The pose points are the pose
+   model's own for this frame. The pose that is output is smoothed, as MediaPipe
+   smooths it, and the smoothing lags behind fast hands, so boxes made from it put
+   hands on the collar or the face. On 87 test videos of one person, compared with
+   RTMW-x, boxes from the unsmoothed pose put a quarter fewer hands in the wrong
+   place, on the wrong side or in both slots (83 against 109), and missed about as
+   many hands.
 2. The box is redrawn around the hand's own landmarks, and the model runs again.
    This happens twice.
 3. If the hand model is unsure, MediaPipe's palm detector searches around the arm's
@@ -39,15 +45,14 @@ it runs on the GPU and is more accurate than Holistic (see Results).
 
 ## Results
 
-Measured on 480 frames from the RSL-News test split: 48 windows of sign-language
-news across three TV channels. The comparison is MediaPipe's HolisticLandmarker.
-RTMW-x served as an independent reference. Every case where the systems disagreed
-was rated by eye without knowing which output was which. Other footage was not
-measured.
+Measured on 480 frames of 48 test videos of one person, from three TV channels.
+The comparison is MediaPipe's HolisticLandmarker. RTMW-x served as an independent
+reference. Every case where the systems disagreed was rated by eye without knowing
+which output was which. Other footage was not measured.
 
-- Hands missed or wrong: 5 of 955 hand slots (0.5%), against 99 (10.4%) for
-  Holistic. It never put a hand in the wrong place or on the other hand; Holistic
-  did so 5 times.
+- Hands missed or wrong: 12 of 955 hand slots (1.3%), against 99 (10.4%) for
+  Holistic. It put a hand in the wrong place once (a hand just below the frame,
+  drawn on the forearm) and never on the other hand; Holistic did so 5 times.
 - Where both find a hand, both are equally close to RTMW (median 2.6 px).
 - Shoulders, elbows and wrists are closer to RTMW: median 2.7, 4.3 and 4.5 px,
   against 3.4, 4.9 and 6.0. The one weak spot is an elbow hidden behind ProTV's
@@ -74,11 +79,19 @@ pose and face detectors run only when there is nothing to track; the palm detect
 runs only for the hand search in step 3 above.
 
 With `backend='litert'` the models run on the CPU with MediaPipe's own arithmetic.
-The output was then checked byte-identical to the same method built from
-mediapipe 1.0.1's Python tasks. With TensorRT, only the models' floating-point
-rounding differs. On 19 clips this changed the results about as much as changing
-0.5% of the input pixels by ±1. fp16 and TF32 move pose points by 1 to 3 px, so
-they are not used.
+In version 1.0.0, whose hand boxes came from the smoothed pose, the output was
+checked byte-identical to the same method built from mediapipe 1.0.1's Python tasks.
+Those tasks do not give the unsmoothed pose, so the hands of version 1.1.0 have no
+such reference. Its pose and face are byte-identical to version 1.0.0's.
+
+With TensorRT, only the models' floating-point rounding differs. On 19 clips this
+changed the results about as much as changing 0.5% of the input pixels by ±1. Each
+frame's pose box comes from the previous frame's points, so the two backends' boxes
+can drift about a pixel apart. On a frame where the model is unsure, as on a fast,
+blurred hand, that pixel can move a point far: in a 40-frame test, one frame's right
+index finger moved 65 px. Given the same box for that frame, the two backends
+agreed to within 0.01 px. fp16 and TF32 move pose points by 1 to 3 px, so they are
+not used.
 
 ## Use
 
@@ -98,8 +111,8 @@ fastest setup.
 
 ## Settings
 
-The settings are in `common.Options`; each has a comment there. The defaults are
-what RSL-News uses. None was chosen for the best score on some data:
+The settings are in `common.Options`; each has a comment there. None of the
+defaults was chosen for the best score on some data:
 
 - The wrist must be visible (≥ 0.1) for its hand to be looked for, as in Holistic.
 - `hand_refine_scale` (1.6) makes the refinement box the size MediaPipe's own hand
@@ -110,7 +123,11 @@ what RSL-News uses. None was chosen for the best score on some data:
   landmarks lie within 0.25 hand sizes on average. On 19 broadcast clips, one hand
   found twice was within 0.1, and two real hands held close were 0.3 or more apart.
 - `hand_presence_threshold` (0.5), `hand_reject_threshold` (0.2) and
-  `fallback_roi_scale` (3.0) are round values; nothing records them being tuned.
+  `fallback_roi_scale` (3.0) are round values. Other values were tried on 87 test
+  videos of one person, compared with RTMW-x: a presence threshold of 0.8, a reject
+  threshold of 0.1 or 0.05, a `fallback_roi_scale` of 2 or 4, a wrist gate of 0.05,
+  and lower palm-detector thresholds. None found more real hands without also adding
+  wrong ones, so the round values stay.
 
 ## Output
 
@@ -122,9 +139,9 @@ person's.
 
 | array | shape, type | |
 |---|---|---|
-| `pose_xyz` | (T, 33, 3) float16 | MediaPipe's 33 pose points |
-| `pose_vis`, `pose_pres` | (T, 33) uint8 | each point's visibility and presence, 0 to 255 |
-| `pose_world` | (T, 33, 3) float16 | in metres, centred between the hips |
+| `pose_xyz` | (T, 33, 3) float16 | MediaPipe's 33 pose points, smoothed as MediaPipe smooths them (the hands are found from the unsmoothed points) |
+| `pose_vis`, `pose_pres` | (T, 33) uint8 | each point's visibility (smoothed) and presence, 0 to 255 |
+| `pose_world` | (T, 33, 3) float16 | in metres, centred between the hips, smoothed |
 | `pose_ok` | (T,) bool | pose found: the pose model's presence score for the whole pose is above `min_pose_presence_confidence` (0.5); that score is not stored |
 | `face_xyz` | (T, 478, 3) float16 | face mesh with irises |
 | `face_ok` | (T,) bool | face found |

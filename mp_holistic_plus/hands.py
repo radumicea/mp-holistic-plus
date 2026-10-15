@@ -4,7 +4,9 @@ For each arm with a pose wrist of visibility >= 0.1:
 
 1. HandCropMLP predicts the hand's box from the arm's pose points; the rotation is
    MediaPipe's estimate from the wrist, index and pinky (common.heuristic_rotation_deg).
-   The hand landmark model runs on that crop.
+   The hand landmark model runs on that crop. The pose points, here and in the steps
+   below, are the pose model's own for this frame, not the filtered output pose, which
+   lags behind fast hands.
 2. The hand is re-cropped around its own landmarks and run again
    (Options.hand_refine_passes, hand_refine_scale).
 3. If the hand is on the other arm (common.side_ok) or its presence is below
@@ -108,7 +110,8 @@ class HandStage:
                 break
 
     def run(self, frames):
-        """frames: one dict per video with rgb, W, H, pose_ok, pose_xyz, pose_vis, pose_world.
+        """frames: one dict per video with rgb, W, H, pose_ok, pose_xyz (unfiltered), pose_vis
+        and pose_world (filtered).
         Returns per frame a dict of hand_xyz, hand_world, hand_score, hand_roi, hand_ok."""
         jobs = []                                             # (frame index, side index, side)
         for f, fr in enumerate(frames):

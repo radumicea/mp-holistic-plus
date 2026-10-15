@@ -283,7 +283,8 @@ class PoseStage:
     def run(self, tracks, canvas, sizes, t_ns):
         """One frame of each video (canvas: the frames on the GPU; sizes: (H, W) each; t_ns:
         timestamps). Returns per video None (no pose) or a dict of pose_xyz (normalized),
-        pose_vis, pose_pres and pose_world (metres), as float32."""
+        pose_vis, pose_pres and pose_world (metres), filtered as MediaPipe filters them, and
+        pose_xyz_raw, the pose model's own landmarks for this frame, as float32."""
         n = len(tracks)
         rois = [None] * n
         for i, tr in enumerate(tracks):
@@ -338,5 +339,6 @@ class PoseStage:
             sm = P if obj < f32(1e-6) else tr.euro_norm.apply(t_ns[i], P.reshape(-1), f32(f32(1.0) / obj)).reshape(33, 3)
             xyz = np.stack([sm[:, 0] / f32(W), sm[:, 1] / f32(H), sm[:, 2] / f32(W)], 1).astype(f32)
             wsm = tr.euro_world.apply(t_ns[i], world.reshape(-1), f32(1.0)).reshape(33, 3)
-            out[i] = dict(pose_xyz=xyz, pose_vis=vis_s, pose_pres=pres[:33].astype(f32), pose_world=wsm.astype(f32))
+            out[i] = dict(pose_xyz=xyz, pose_vis=vis_s, pose_pres=pres[:33].astype(f32), pose_world=wsm.astype(f32),
+                          pose_xyz_raw=np.stack([px[:33], py[:33], pz[:33]], 1).astype(f32))
         return out

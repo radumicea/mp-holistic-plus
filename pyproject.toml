@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mp-holistic-plus"
-version = "1.0.0"
+version = "1.1.0"
 description = "Pose, face and hand landmarks of one person per video with MediaPipe's models, batched on an NVIDIA GPU"
 readme = "README.md"
 license = "Apache-2.0"
