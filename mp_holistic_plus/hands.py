@@ -18,15 +18,16 @@ For each arm with a pose wrist of visibility >= 0.1:
    physical hand (common.hands_coincide), it is kept on the arm whose pose wrist is
    nearer.
 
-All hand-model calls of one step are one batched call.
+All hand-model calls of one step are one batched call. The crops are cv2.warpAffine's,
+made on the GPU by mpgeom.warp_affine.
 """
 import math
 
-import cv2
 import numpy as np
 import torch
 
 from . import common as hp
+from . import mpgeom as G
 
 SIDES = hp.HAND_SIDES
 
@@ -49,21 +50,24 @@ class HandStage:
         # as x * (1 / 255), which is 1 ulp off for half the values, so look the quotients up.
         self.lut = torch.from_numpy(np.arange(256, dtype=np.uint8).astype(np.float32) / 255.0).to(device)
 
-    def at_rois(self, reqs):
-        """Run the hand model on many boxes at once. reqs: (rgb, cx, cy, side, rot_deg, W, H)
-        per box, normalized as in Hand.roi. Returns per box a Hand, or None if the box is
-        not finite or under 4 px."""
-        out, crops, keep = [None] * len(reqs), [], []
-        for i, (rgb, cx, cy, size, rot_deg, W, H) in enumerate(reqs):
+    def at_rois(self, canvas, reqs):
+        """Run the hand model on many boxes at once. canvas: the frames on the GPU (as
+        PoseStage.run takes them); reqs: (k, cx, cy, side, rot_deg, W, H) per box, k the
+        frame's index in canvas, the box normalized as in Hand.roi. Returns per box a Hand,
+        or None if the box is not finite or under 4 px."""
+        out, Ms, keep = [None] * len(reqs), [], []
+        for i, (k, cx, cy, size, rot_deg, W, H) in enumerate(reqs):
             size_px = size * max(W, H)
             if not (np.isfinite(size_px) and size_px > 4.0 and np.isfinite(cx) and np.isfinite(cy)):
                 continue
             M, Minv = hp.crop_affine(cx * W, cy * H, size_px, rot_deg, hp.HAND_INPUT_SIZE)
-            crops.append(np.ascontiguousarray(cv2.warpAffine(rgb, M, (hp.HAND_INPUT_SIZE, hp.HAND_INPUT_SIZE), flags=cv2.INTER_LINEAR)))
+            Ms.append(M)
             keep.append((i, Minv, size_px))
-        if not crops:
+        if not keep:
             return out
-        x = self.lut[torch.from_numpy(np.stack(crops)).to(self.device).long()]
+        crops = G.warp_affine(canvas, [reqs[i][0] for i, _, _ in keep], [(reqs[i][6], reqs[i][5]) for i, _, _ in keep],
+                              Ms, hp.HAND_INPUT_SIZE)
+        x = self.lut[crops.long()]
         res = {}
         for s in range(0, len(crops), 64):
             r = self.engine(x[s:s + 64])
@@ -73,7 +77,7 @@ class HandStage:
         pres_all = torch.cat(res['Identity_1']).cpu().numpy().reshape(-1)
         world_all = torch.cat(res['Identity_3']).cpu().numpy().reshape(-1, hp.N_HAND, 3)
         for j, (i, Minv, size_px) in enumerate(keep):
-            rgb, cx, cy, size, rot_deg, W, H = reqs[i]
+            _, cx, cy, size, rot_deg, W, H = reqs[i]
             lm_crop, world_crop, presence = lm_all[j], world_all[j], float(pres_all[j])
             lm_norm = hp.decode_hand(lm_crop, Minv, size_px, W, H)
             a = math.radians(rot_deg)
@@ -84,22 +88,23 @@ class HandStage:
             out[i] = Hand(lm_norm, world, presence, (cx, cy, size, rot_deg))
         return out
 
-    def refine(self, items):
-        """items: [rgb, W, H, Hand or None] lists. Each hand is replaced in place by the
-        model's result on the box around its own landmarks, up to hand_refine_passes
-        times; a result with lower presence is discarded and ends that hand's passes."""
+    def refine(self, canvas, items):
+        """items: [k, W, H, Hand or None] lists (k: the frame's index in canvas). Each hand is
+        replaced in place by the model's result on the box around its own landmarks, up to
+        hand_refine_passes times; a result with lower presence is discarded and ends that
+        hand's passes."""
         active = list(range(len(items)))
         for _ in range(self.opts.hand_refine_passes):
             reqs, idx = [], []
             for i in active:
-                rgb, W, H, got = items[i]
+                k, W, H, got = items[i]
                 if got is None or not np.all(np.isfinite(got.lm[:, :2])):
                     continue
                 cx, cy, size_abs, rot = hp.landmarks_to_roi(got.lm[:, :2] * np.array([W, H], np.float32),
                                                             scale=self.opts.hand_refine_scale)
-                reqs.append((rgb, cx / W, cy / H, size_abs / max(W, H), rot, W, H))
+                reqs.append((k, cx / W, cy / H, size_abs / max(W, H), rot, W, H))
                 idx.append(i)
-            nxt = self.at_rois(reqs)
+            nxt = self.at_rois(canvas, reqs)
             active = []
             for i, n in zip(idx, nxt):
                 if n is None or n.score < items[i][3].score:
@@ -109,9 +114,10 @@ class HandStage:
             if not active:
                 break
 
-    def run(self, frames):
-        """frames: one dict per video with rgb, W, H, pose_ok, pose_xyz (unfiltered), pose_vis
-        and pose_world (filtered).
+    def run(self, frames, canvas):
+        """frames: one dict per video with W, H, pose_ok, pose_xyz (unfiltered), pose_vis and
+        pose_world (filtered); canvas: the frames on the GPU, in that order (as PoseStage.run
+        takes them).
         Returns per frame a dict of hand_xyz, hand_world, hand_score, hand_roi, hand_ok."""
         jobs = []                                             # (frame index, side index, side)
         for f, fr in enumerate(frames):
@@ -132,13 +138,13 @@ class HandStage:
                 continue
             cx, cy, size = self.mlp.predict(arm, W / H, side)
             rot_deg = hp.heuristic_rotation_deg(arm[2, :2] * (W, H), arm[4, :2] * (W, H), arm[5, :2] * (W, H))
-            reqs.append((fr['rgb'], cx, cy, size, rot_deg, W, H))
+            reqs.append((f, cx, cy, size, rot_deg, W, H))
             req_jobs.append(j)
-        for j, h in zip(req_jobs, self.at_rois(reqs)):
+        for j, h in zip(req_jobs, self.at_rois(canvas, reqs)):
             got[j] = h
         # 2. re-crop around the landmarks
-        items = [[frames[j[0]]['rgb'], frames[j[0]]['W'], frames[j[0]]['H'], got[j]] for j in jobs]
-        self.refine(items)
+        items = [[j[0], frames[j[0]]['W'], frames[j[0]]['H'], got[j]] for j in jobs]
+        self.refine(canvas, items)
         for j, it in zip(jobs, items):
             got[j] = it[3]
         # 3. on the other arm or unsure: the palm detector
@@ -150,15 +156,23 @@ class HandStage:
                 got[j] = None
             if got[j] is None or got[j].score < self.opts.hand_presence_threshold:
                 fb_jobs.append(j)
-        rois = list(self.fallback.pool.map(lambda j: self.fallback_roi(frames[j[0]], j[2]), fb_jobs))
+        boxes = [self.fallback_box(frames[j[0]], j[2]) for j in fb_jobs]
+        searched = [q for q, bx in enumerate(boxes) if bx is not None]
+        crops = G.warp_affine(canvas, [fb_jobs[q][0] for q in searched],
+                              [(frames[fb_jobs[q][0]]['H'], frames[fb_jobs[q][0]]['W']) for q in searched],
+                              [boxes[q][0] for q in searched], hp.HAND_FALLBACK_SIZE).cpu().numpy()
+        rois = [None] * len(fb_jobs)
+        for q, rs in zip(searched, self.fallback.pool.map(
+                lambda q, crop: self.fallback_roi(frames[fb_jobs[q][0]], fb_jobs[q][0], boxes[q], crop), searched, crops)):
+            rois[q] = rs
         fb_items, fb_of = [], []
         for j, rs in zip(fb_jobs, rois):
             for r in rs or ():
                 fb_items.append(r)
                 fb_of.append(j)
-        fb_hands = self.at_rois(fb_items) if fb_items else []
-        items = [[frames[j[0]]['rgb'], frames[j[0]]['W'], frames[j[0]]['H'], h] for j, h in zip(fb_of, fb_hands)]
-        self.refine(items)
+        fb_hands = self.at_rois(canvas, fb_items) if fb_items else []
+        items = [[j[0], frames[j[0]]['W'], frames[j[0]]['H'], h] for j, h in zip(fb_of, fb_hands)]
+        self.refine(canvas, items)
         cands = {}
         for j, it in zip(fb_of, items):
             cands.setdefault(j, []).append(it[3])
@@ -210,12 +224,11 @@ class HandStage:
                 row['hand_ok'][drop] = False
         return rows
 
-    def fallback_roi(self, fr, side):
-        """Run the palm detector (MediaPipe HandLandmarker) on a square around the arm's
-        wrist, thumb, index and pinky pose points (Options.fallback_roi_scale). Returns, per
-        hand it finds, the box around that hand's landmarks as at_rois takes it; or None."""
-        import mediapipe as mp
-        W, H, rgb = fr['W'], fr['H'], fr['rgb']
+    def fallback_box(self, fr, side):
+        """The square the palm detector searches: around the arm's wrist, thumb, index and
+        pinky pose points (Options.fallback_roi_scale). (M, Minv, side in px) of its crop
+        (common.crop_affine), or None."""
+        W, H = fr['W'], fr['H']
         arm = fr['pose_xyz'][hp.POSE_ARM_IDX[side]]
         if not np.all(np.isfinite(arm)):
             return None
@@ -226,7 +239,15 @@ class HandStage:
         if size_px < 8:
             return None
         M, Minv = hp.crop_affine(float(c[0]), float(c[1]), size_px, 0.0, hp.HAND_FALLBACK_SIZE)
-        crop = np.ascontiguousarray(cv2.warpAffine(rgb, M, (hp.HAND_FALLBACK_SIZE, hp.HAND_FALLBACK_SIZE), flags=cv2.INTER_LINEAR))
+        return M, Minv, size_px
+
+    def fallback_roi(self, fr, k, box, crop):
+        """Run the palm detector (MediaPipe HandLandmarker) on `crop`, the square of
+        fallback_box `box` of frame k. Returns, per hand it finds, the box around that hand's
+        landmarks as at_rois takes it; or None."""
+        import mediapipe as mp
+        W, H = fr['W'], fr['H']
+        _, Minv, size_px = box
         res = self.fallback.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=crop))
         if not res.hand_landmarks:
             return None
@@ -235,5 +256,5 @@ class HandStage:
             lm_crop = np.array([[p.x, p.y, p.z] for p in hand], np.float32)
             lm = hp.unmap_crop(lm_crop, Minv, hp.HAND_FALLBACK_SIZE, size_px, W, H)
             cx, cy, size_abs, rot_deg = hp.landmarks_to_roi(lm[:, :2] * np.array([W, H], np.float32), scale=self.opts.hand_refine_scale)
-            out.append((rgb, cx / W, cy / H, size_abs / max(W, H), rot_deg, W, H))
+            out.append((k, cx / W, cy / H, size_abs / max(W, H), rot_deg, W, H))
         return out

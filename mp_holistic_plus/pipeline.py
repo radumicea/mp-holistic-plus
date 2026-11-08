@@ -181,15 +181,15 @@ class HolisticPlus:
                 canvas[k, :img.shape[0], :img.shape[1]] = torch.from_numpy(img)
             canvas = canvas.cuda(non_blocking=True)
             poses = self.pose.run([s.pose for s in active], canvas, sizes, [t * 1_000_000 for t in ts])
-            faces = self.face.run([s.face for s in active], imgs, poses, ts)
+            faces = self.face.run([s.face for s in active], canvas, sizes, poses, ts)
             # the hands are found from the pose model's own landmarks: the filtered pose lags
             # behind fast hands (README.md)
-            frames = [dict(rgb=img, W=s.W, H=s.H, pose_ok=p is not None,
+            frames = [dict(W=s.W, H=s.H, pose_ok=p is not None,
                            pose_xyz=p['pose_xyz_raw'] if p else np.full((33, 3), np.nan, np.float32),
                            pose_vis=p['pose_vis'] if p else np.zeros(33, np.float32),
                            pose_world=p['pose_world'] if p else None)
-                      for s, img, p in zip(active, imgs, poses)]
-            hand_rows = self.hands.run(frames)
+                      for s, p in zip(active, poses)]
+            hand_rows = self.hands.run(frames, canvas)
             for s, p, fc, hr in zip(active, poses, faces, hand_rows):
                 row = hp.FrameRow()
                 if p is not None:

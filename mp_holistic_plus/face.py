@@ -2,7 +2,8 @@
 pose's face points, for many videos at once.
 
 Per video: a 256 x 256 crop around pose points 0-10 (common.face_roi_from_pose, made
-with OpenCV on the CPU; no pose, no face). On it, as FaceLandmarker does: the face
+by cv2.warpAffine, or mpgeom.warp_affine, its copy on the GPU; no pose, no face). On it,
+as FaceLandmarker does: the face
 detector (short-range BlazeFace, LiteRT, CPU) when there is no track, the landmark
 model on the face box (batched on the GPU), the presence check, the next frame's box
 from the landmarks, and One Euro smoothing. The landmarks are then mapped from the
@@ -15,7 +16,6 @@ to mediapipe 1.0.1's FaceLandmarker on the CPU, given the same crop.
 """
 import math
 
-import cv2
 import numpy as np
 import torch
 
@@ -126,27 +126,28 @@ class FaceStage:
     def __init__(self, engine, detector):
         self.engine, self.detector = engine, detector
 
-    def run(self, tracks, frames, poses, ts_ms):
-        """frames: RGB uint8 per video; poses: PoseStage.run's output; ts_ms: timestamps.
+    def run(self, tracks, frames, sizes, poses, ts_ms):
+        """frames: the RGB frames on the GPU (as PoseStage.run takes them); sizes: (H, W) of
+        each; poses: PoseStage.run's output; ts_ms: timestamps.
         Returns per video the (478, 3) landmarks normalized to the frame, or None."""
         n = len(tracks)
         out = [None] * n
         jobs = []                                                   # (video, Minv, size_px)
-        crops = []
+        Ms = []
         for i in range(n):
             if poses[i] is None:
                 continue
-            H, W = frames[i].shape[:2]
+            H, W = sizes[i]
             roi = hp.face_roi_from_pose(poses[i]['pose_xyz'], W, H)
             if roi is None:
                 continue
             cx_px, cy_px, size_px = roi
             M, Minv = hp.crop_affine(cx_px, cy_px, size_px, 0.0, FACE)
-            crops.append(np.ascontiguousarray(cv2.warpAffine(frames[i], M, (FACE, FACE), flags=cv2.INTER_LINEAR)))
+            Ms.append(M)
             jobs.append((i, Minv, size_px))
         if not jobs:
             return out
-        canvas = torch.from_numpy(np.stack(crops)).cuda()
+        canvas = G.warp_affine(frames, [i for i, _, _ in jobs], [sizes[i] for i, _, _ in jobs], Ms, FACE)
         rects = []
         for k, (i, _, _) in enumerate(jobs):
             tr = tracks[i]
@@ -201,6 +202,6 @@ class FaceStage:
                     tr.smoother = OneEuro(478 * 3, 0.05, 80.0, 1.0)
                 S = tr.smoother.apply(int(ts_ms[i]) * 1000 * 1000, Lp.reshape(-1), f32(f32(1) / osc)).reshape(478, 3)
             lm = np.stack([S[:, 0] / f32(W), S[:, 1] / f32(H), S[:, 2] / f32(W)], 1).astype(f32)
-            H0, W0 = frames[i].shape[:2]
+            H0, W0 = sizes[i]
             out[i] = hp.unmap_crop(lm, Minv, FACE, size_px, W0, H0)
         return out

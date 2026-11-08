@@ -74,15 +74,17 @@ of them, as a TensorRT fp32 engine.
 MediaPipe's pose and face landmarkers are rewritten from MediaPipe's C++ source:
 detection, tracking, crops, heatmap refinement and smoothing. Each step computes the
 same numbers as MediaPipe, including OpenCV's fixed-point crop, which is redone on
-the GPU. The pose and face detectors and the palm detector run on the CPU. The
-pose and face detectors run only when there is nothing to track; the palm detector
-runs only for the hand search in step 3 above.
+the GPU. The face and hand crops, made with OpenCV 5.0's `cv2.warpAffine`, are redone
+on the GPU too, byte-identical. The pose and face detectors and the palm detector
+run on the CPU. The pose and face detectors run only when there is nothing to track;
+the palm detector runs only for the hand search in step 3 above.
 
 With `backend='litert'` the models run on the CPU with MediaPipe's own arithmetic.
 In version 1.0.0, whose hand boxes came from the smoothed pose, the output was
 checked byte-identical to the same method built from mediapipe 1.0.1's Python tasks.
-Those tasks do not give the unsmoothed pose, so the hands of version 1.1.0 have no
-such reference. Its pose and face are byte-identical to version 1.0.0's.
+Those tasks do not give the unsmoothed pose, so the hands from version 1.1.0 on have no
+such reference. Their pose and face are byte-identical to version 1.0.0's, and all of
+version 1.2.0's output (crops on the GPU) to version 1.1.0's.
 
 With TensorRT, only the models' floating-point rounding differs. On 19 clips this
 changed the results about as much as changing 0.5% of the input pixels by ±1. Each
@@ -161,8 +163,8 @@ pip install --extra-index-url https://download.pytorch.org/whl/cu130 \
 An NVIDIA GPU with a driver for CUDA 13. The package pins `tensorrt-cu13==10.15.1.29`,
 `torch==2.11.0` (the CUDA 13 build, from the index above), `onnx==1.23.1`,
 `mediapipe==1.0.1`, `ai-edge-litert==2.2.0`, `opencv-contrib-python==5.0.0.93` and
-`numpy==2.2.6`. Keep the OpenCV version: the crops are made with OpenCV, and other
-builds round them differently.
+`numpy==2.2.6`, and `triton==3.6.0`, the one that comes with that torch. Keep the
+OpenCV version: it decodes the videos, and other builds may decode them differently.
 
 On first use, the MediaPipe bundles are downloaded to `~/.cache/mp_holistic_plus`
 (or `$MP_HOLISTIC_PLUS_CACHE`) and checked against their sha256, and their models
@@ -178,7 +180,8 @@ In `mp_holistic_plus/`:
 - `pose.py`, `face.py`, `hands.py`: the three stages.
 - `common.py`: options, model files, hand-box network, crop geometry, hand checks,
   the output file (numpy and OpenCV only).
-- `mpgeom.py`: MediaPipe's crop geometry, bit for bit, with the crop on the GPU.
+- `mpgeom.py`: MediaPipe's crop geometry, bit for bit, with the crop on the GPU, and
+  OpenCV's `warpAffine` on the GPU (Triton), bit for bit.
 - `tflite_torch.py`, `trt_engine.py`: a MediaPipe `.tflite` model turned into a
   TensorRT engine, through PyTorch and ONNX.
 - `assets/hand_crop_mlp.npz`: the hand-box network's weights.

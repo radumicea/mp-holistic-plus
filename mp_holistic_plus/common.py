@@ -288,42 +288,33 @@ class FrameRow:
 
 
 class Recorder:
-    """The rows of one video, written as one .npz (format in README.md)."""
+    """The rows of one video, written as one .npz (format in README.md). Each row is stored in
+    the file's types as it comes, in blocks of BLOCK frames: about 3.9 KB a frame, where
+    Python rows took about 11 KB (a batch of long videos ran out of memory)."""
+    BLOCK = 4096
+    FIELDS = {"pose_xyz": ((N_POSE, 3), np.float16), "pose_vis": ((N_POSE,), np.uint8),
+              "pose_pres": ((N_POSE,), np.uint8), "pose_world": ((N_POSE, 3), np.float16),
+              "pose_ok": ((), bool), "face_xyz": ((N_FACE, 3), np.float16), "face_ok": ((), bool),
+              "hand_xyz": ((2, N_HAND, 3), np.float16), "hand_world": ((2, N_HAND, 3), np.float16),
+              "hand_score": ((2,), np.uint8), "hand_ok": ((2,), bool), "hand_roi": ((2, 4), np.float32)}
+
     def __init__(self):
-        self.rows = {k: [] for k in FrameRow.__slots__}
+        self.T, self.blocks = 0, []
 
     def append(self, row: FrameRow):
-        for k, v in self.rows.items():
-            v.append(getattr(row, k))
+        i = self.T % self.BLOCK
+        if i == 0:
+            self.blocks.append({k: np.empty((self.BLOCK,) + shape, dtype)
+                                for k, (shape, dtype) in self.FIELDS.items()})
+        for k, (shape, dtype) in self.FIELDS.items():
+            v = getattr(row, k)
+            if dtype == np.uint8:     # [0, 1] -> 0..255
+                v = np.clip(np.rint(np.asarray(v, np.float32) * 255.0), 0, 255)
+            elif dtype != bool:       # float32 first, then the file's type
+                v = np.asarray(v, np.float32)
+            self.blocks[-1][k][i] = v
+        self.T += 1
 
     def save(self, path: Path):
-        T = len(self.rows["pose_ok"])
-
-        def stack(k, shape):   # a video with no frames still gets arrays of the right rank
-            return (np.asarray(self.rows[k], np.float32) if T else
-                    np.zeros((0,) + shape, np.float32))
-
-        def f16(k, shape):
-            return stack(k, shape).astype(np.float16)
-
-        def u8(k, shape):      # [0, 1] -> 0..255
-            return np.clip(np.rint(stack(k, shape) * 255.0), 0, 255).astype(np.uint8)
-
-        def flags(k, shape):
-            return np.asarray(self.rows[k], bool).reshape((T,) + shape)
-
-        np.savez(
-            path,
-            pose_xyz=f16("pose_xyz", (N_POSE, 3)),
-            pose_vis=u8("pose_vis", (N_POSE,)),
-            pose_pres=u8("pose_pres", (N_POSE,)),
-            pose_world=f16("pose_world", (N_POSE, 3)),
-            pose_ok=flags("pose_ok", ()),
-            face_xyz=f16("face_xyz", (N_FACE, 3)),
-            face_ok=flags("face_ok", ()),
-            hand_xyz=f16("hand_xyz", (2, N_HAND, 3)),
-            hand_world=f16("hand_world", (2, N_HAND, 3)),
-            hand_score=u8("hand_score", (2,)),
-            hand_ok=flags("hand_ok", (2,)),
-            hand_roi=stack("hand_roi", (2, 4)),
-        )
+        np.savez(path, **{k: np.concatenate([b[k] for b in self.blocks])[:self.T] if self.T else
+                          np.zeros((0,) + shape, dtype) for k, (shape, dtype) in self.FIELDS.items()})

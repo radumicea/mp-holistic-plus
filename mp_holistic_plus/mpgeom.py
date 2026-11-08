@@ -9,11 +9,17 @@ MediaPipe crops a rotated box out of the frame with OpenCV's warpPerspective.
 - to_float: the crop to float32, as MediaPipe converts it.
 - expf, sigmoid_f, cosf, sinf, atan2f: float32 functions, computed in float64 and
   rounded, which gives glibc's correctly rounded results.
+
+The face and hand crops are not MediaPipe's but cv2.warpAffine's (OpenCV 5), which
+warp_affine reproduces on the GPU, also bit for bit.
 """
 import math
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 f32 = np.float32
 
@@ -170,3 +176,90 @@ def to_float(u8, lo, hi):
     """convertTo(scale, offset) to float32, as two roundings (u8*scale, then +offset)."""
     scale = f32(f32(hi - lo) / f32(255.0))
     return u8.float() * float(scale) + float(f32(lo))
+
+
+@triton.jit
+def _warp_affine(src, dst, frame, hw, mat, Hm, Wm, S: tl.constexpr, BLOCK: tl.constexpr):
+    """BLOCK pixels of crop program_id(1). Every float step is explicitly rounded (*_rn), so
+    the result does not depend on the compiler fusing multiplies and adds."""
+    c = tl.program_id(1)
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = p < S * S
+    y = p // S
+    x = p - y * S
+    k = tl.load(frame + c).to(tl.int64)
+    H = tl.load(hw + 2 * c)
+    W = tl.load(hw + 2 * c + 1)
+    m0 = tl.load(mat + 6 * c)
+    m1 = tl.load(mat + 6 * c + 1)
+    m2 = tl.load(mat + 6 * c + 2)
+    m3 = tl.load(mat + 6 * c + 3)
+    m4 = tl.load(mat + 6 * c + 4)
+    m5 = tl.load(mat + 6 * c + 5)
+    xf = x.to(tl.float32)
+    yf = y.to(tl.float32)
+    sx = libdevice.fma_rn(m0, xf, libdevice.add_rn(libdevice.mul_rn(yf, m1), m2))
+    sy = libdevice.fma_rn(m3, xf, libdevice.add_rn(libdevice.mul_rn(yf, m4), m5))
+    flx = libdevice.floor(sx)
+    fly = libdevice.floor(sy)
+    a = libdevice.sub_rn(sx, flx)
+    b = libdevice.sub_rn(sy, fly)
+    ix = tl.minimum(tl.maximum(flx, -1048576.0), 1048576.0).to(tl.int32)   # beyond: outside anyway
+    iy = tl.minimum(tl.maximum(fly, -1048576.0), 1048576.0).to(tl.int32)
+    in_x0 = (ix >= 0) & (ix < W)
+    in_x1 = (ix + 1 >= 0) & (ix + 1 < W)
+    in_y0 = (iy >= 0) & (iy < H) & valid
+    in_y1 = (iy + 1 >= 0) & (iy + 1 < H) & valid
+    o00 = ((k * Hm + iy) * Wm + ix) * 3
+    o10 = o00 + Wm * 3
+    out = ((c.to(tl.int64) * S + y) * S + x) * 3
+    for ch in tl.static_range(3):
+        p00 = tl.load(src + o00 + ch, mask=in_y0 & in_x0, other=0).to(tl.float32)
+        p01 = tl.load(src + o00 + 3 + ch, mask=in_y0 & in_x1, other=0).to(tl.float32)
+        p10 = tl.load(src + o10 + ch, mask=in_y1 & in_x0, other=0).to(tl.float32)
+        p11 = tl.load(src + o10 + 3 + ch, mask=in_y1 & in_x1, other=0).to(tl.float32)
+        f0 = libdevice.fma_rn(a, libdevice.sub_rn(p01, p00), p00)
+        f1 = libdevice.fma_rn(a, libdevice.sub_rn(p11, p10), p10)
+        r = libdevice.fma_rn(b, libdevice.sub_rn(f1, f0), f0)
+        v = tl.minimum(tl.maximum(libdevice.float2int_rn(r), 0), 255)
+        tl.store(dst + out + ch, v.to(tl.uint8), mask=valid)
+
+
+def affine_inverse_f32(M):
+    """cv::warpAffine's inverse of a 2x3 map (float64, in its order of operations), as float32."""
+    M = [float(v) for v in np.asarray(M, np.float64).reshape(6)]
+    D = M[0] * M[4] - M[1] * M[3]
+    D = 1. / D if D != 0 else 0.
+    A11, A22 = M[4] * D, M[0] * D
+    M[0] = A11; M[1] *= -D
+    M[3] *= -D; M[4] = A22
+    b1 = -M[0] * M[2] - M[1] * M[5]
+    b2 = -M[3] * M[2] - M[4] * M[5]
+    M[2] = b1; M[5] = b2
+    return np.array(M, f32)
+
+
+def warp_affine(canvas, frames, src_hw, Ms, size):
+    """cv2.warpAffine(frame, M, (size, size), flags=cv2.INTER_LINEAR) of OpenCV 5, for many
+    crops at once on the GPU. canvas: (N, Hmax, Wmax, 3) uint8 on the GPU, the frames top-left
+    aligned; per crop: its frame's index in canvas, that frame's (H, W), and M (2x3, float64).
+    Returns (n, size, size, 3) uint8 on the GPU.
+
+    OpenCV inverts M in float64 and runs warpAffineLinearInvoker_8UC3 (warp_kernels.simd.hpp,
+    ALGO_HINT_ACCURATE) on float32 copies of it: per pixel, sx = fma(M0, x, y * M1 + M2)
+    (y * M1 + M2 rounded twice), sy likewise; the 2 x 2 source pixels from (floor(sx),
+    floor(sy)), 0 outside the frame; a = sx - floor(sx), b likewise; f0 = fma(a, p01 - p00,
+    p00), f1 = fma(a, p11 - p10, p10), then fma(b, f1 - f0, f0), rounded half to even."""
+    n = len(Ms)
+    dev = canvas.device
+    out = torch.empty((n, size, size, 3), dtype=torch.uint8, device=dev)
+    if n == 0:
+        return out
+    mat = torch.from_numpy(np.stack([affine_inverse_f32(M) for M in Ms])).to(dev)
+    fr = torch.from_numpy(np.asarray(frames, np.int32)).to(dev)
+    hw = torch.from_numpy(np.asarray(src_hw, np.int32).reshape(n, 2)).to(dev)
+    canvas = canvas.contiguous()
+    BLOCK = 1024
+    _warp_affine[(triton.cdiv(size * size, BLOCK), n)](canvas, out, fr, hw, mat, canvas.shape[1], canvas.shape[2],
+                                                      S=size, BLOCK=BLOCK)
+    return out
